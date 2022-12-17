@@ -1,58 +1,99 @@
-use std::{collections::VecDeque, ops::Neg};
+use std::{
+    collections::{hash_map::DefaultHasher, VecDeque},
+    hash::{Hash, Hasher},
+    ops::Neg,
+};
 
 use aoc2022::*;
-use indicatif::{ProgressBar, ProgressStyle};
 
 const INPUT: &str = include_str!("../../input/17");
 
 fn main() {
-    level1();
-    level2();
+    let (solution, max_drop) = simulate(2022, None);
+    solved_level_1(solution);
+    let (solution, _) = simulate(1000000000000, max_drop);
+    solved_level_2(solution);
 }
 
-fn level1() {
-    let rocks = Rock::stream().take(2022);
-    let mut jet = jet();
-    let mut pile = Pile::default();
+/// Get (pile height, maximum drop height) after simulating a number of rocks.
+/// This detects cycles in the forming pile and skips simulating large chunks of repetition.
+/// Truncate is the maximum height of the tower that should be kept.
+fn simulate(rocks: usize, truncate: impl Into<Option<usize>>) -> (i64, usize) {
+    let mut jet = input().cycle();
+    let mut pile = Pile::new(truncate.into().unwrap_or(usize::MAX));
+
+    let mut rock_stream = Rock::stream();
+
+    // There are five types of rocks and the input has a certain length.
+    // This is the period the input repeats.
+    // We always simulate a whole repeat_period while checking for cycles, since only after
+    // that time has the pile a chance to repeat.
+    let repeat_period = input().count() * 5;
+
+    // Keep track of (iteration, hash of pile, height of pile) to detect cycles.
+    let mut states = Vec::new();
 
     let mut max_drop = 0;
 
-    for rock in rocks {
+    let mut i = 0;
+    while i < rocks {
+        i += 1;
+
+        let rock = rock_stream.next().unwrap();
         let dropped = pile.drop(rock, &mut jet);
         max_drop = max_drop.max(dropped);
+
+        // This if-block was added as an optimization for level 2.
+        // The code works without it, but is impossibly slow in level 2.
+        if i % repeat_period == 0 {
+            let mut hasher = DefaultHasher::new();
+            pile.rows.hash(&mut hasher);
+            let hash = hasher.finish();
+            let height = pile.height();
+
+            // Have we already seen this pile?
+            if let Some(&(prev_i, _, prev_height)) =
+                states.iter().find(|(_, prev_hash, _)| *prev_hash == hash)
+            {
+                // We have already seen this pile -> cycle found. We can now skip a large portion of the simulation.
+                let jump_height = height - prev_height;
+                let jump_i = i - prev_i;
+                let remaining = rocks - i;
+                let jumps = remaining / jump_i;
+                if jumps == 0 {
+                    // Nothing to skip, simulation is almost done.
+                    continue;
+                }
+                println!("Found cycle: Iteration {i} looks like iteration {prev_i}.");
+                println!("Fast fowarding {} iterations.", jumps * jump_i);
+                i += jumps * jump_i;
+                pile.additional_height += jumps as i64 * jump_height;
+                println!("{} iterations left.", rocks - i);
+            }
+
+            states.push((i, hash, height));
+        }
     }
 
-    println!("The most a rock dropped was by {max_drop} spaces");
-    solved_level_1(pile.height());
-}
-
-fn level2() {
-    let count = 1000000000000;
-    let rocks = Rock::stream().take(count);
-    let mut jet = jet();
-    let mut pile = Pile::default();
-
-    let style = ProgressStyle::with_template("Solving level 2 [{bar:40}] {percent}%, ~{eta}")
-        .unwrap()
-        .progress_chars("=> ");
-    let bar = ProgressBar::new(count as u64).with_style(style);
-
-    for rock in rocks {
-        bar.inc(1);
-        pile.drop(rock, &mut jet);
-    }
-
-    solved_level_2(pile.height());
+    (pile.height(), max_drop)
 }
 
 /// The pile of already placed rocks.
-#[derive(Default)]
 struct Pile {
     rows: VecDeque<[bool; 7]>,
     additional_height: i64,
+    truncate: usize,
 }
 
 impl Pile {
+    fn new(truncate: usize) -> Self {
+        Self {
+            rows: VecDeque::new(),
+            additional_height: 0,
+            truncate,
+        }
+    }
+
     /// Drop a new rock into the pile. The rock is assumed to be untampered.
     /// Returns the number of spaces the rock dropped down.
     fn drop(&mut self, mut rock: Rock, jet: &mut impl Iterator<Item = Shift>) -> usize {
@@ -60,37 +101,30 @@ impl Pile {
         rock.shift(Shift::Right);
         rock.shift(Shift::Right);
         rock.add_y(self.height() + 3);
-        // println!("Spawned: {rock:?}");
 
         let mut dropped = 0;
 
         loop {
             let shift = jet.next().unwrap();
             rock.shift(shift);
-            // println!("Pushed rock {shift:?}: {rock:?}");
             if !self.fits(&rock) {
-                // println!("Nevermind, rock in the way.");
                 // Oopsy, revert that.
                 rock.shift(-shift);
             }
 
             rock.add_y(-1);
             dropped += 1;
-            // println!("Dropped rock: {rock:?}");
             if !self.fits(&rock) {
                 // The rock could no longer drop down. Revert and place it there.
                 rock.add_y(1);
                 dropped -= 1;
-                // println!("Nevermind, that rock gets settled higher up.");
                 self.place(rock);
-                // self.print();
                 return dropped;
             }
         }
     }
     fn height(&self) -> i64 {
         self.rows.len() as i64 + self.additional_height
-        // self.placed.iter().map(|&(_x, y)| y).max().unwrap_or(0)
     }
     fn place(&mut self, mut rock: Rock) {
         // Bring world-coordinates to truncated coordinates.
@@ -106,8 +140,8 @@ impl Pile {
             self.rows[pos.1 as usize][pos.0 as usize] = true;
         }
 
-        // Truncate tower. Number found by using the maximum length a rock dropped and doubling that.
-        while self.rows.len() > 70 {
+        // Truncate pile.
+        while self.rows.len() > self.truncate {
             self.rows.pop_front();
             self.additional_height += 1;
         }
@@ -151,6 +185,7 @@ impl Pile {
 /// A falling rock.
 #[derive(Debug, Clone)]
 struct Rock(Vec<(i64, i64)>);
+
 /// x points right, y points up. Points are (x, y).
 /// New rocks have their bottom left corner at (0,0).
 impl Rock {
@@ -222,13 +257,10 @@ impl Neg for Shift {
     }
 }
 
-fn jet() -> impl Iterator<Item = Shift> {
-    INPUT
-        .chars()
-        .map(|c| match c {
-            '<' => Shift::Left,
-            '>' => Shift::Right,
-            c => panic!("unknown char in input {c:?}"),
-        })
-        .cycle()
+fn input() -> impl Iterator<Item = Shift> + Clone {
+    INPUT.chars().map(|c| match c {
+        '<' => Shift::Left,
+        '>' => Shift::Right,
+        c => panic!("unknown char in input {c:?}"),
+    })
 }
